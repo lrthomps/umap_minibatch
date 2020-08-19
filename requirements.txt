@@ -1,0 +1,7 @@
+annoy
+matplotlib
+numpy
+pandas
+scipy
+sklearn
+umap-learn

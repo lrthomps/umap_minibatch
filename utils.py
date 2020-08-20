@@ -1,19 +1,19 @@
 from annoy import AnnoyIndex
-import heapq
-
+import copy
+from numba import jit
 import numpy as np
-# import pandas as pd
 from scipy.optimize import curve_fit
 from scipy.sparse import coo_matrix
-from scipy.spatial.distance import cdist, euclidean, sqeuclidean
+from scipy.spatial.distance import cdist
 
 TOLERANCE = 1e-5
+MAX_GRAD = 4.0
 MIN_DIST_SCALE = 1e-3
 
 
 def embed_graph(
         data,  # needed for spectral embedding
-        graph,
+        knn,
         n_components,
         initial_alpha,  # self.learning_rate
         a,
@@ -23,13 +23,13 @@ def embed_graph(
         n_epochs=0,
         init='random'
 ):
-    graph = graph.tocoo()
-    graph.sum_duplicates()
-    n_vertices = graph.shape[1]
+    # graph = graph.tocoo()
+    # graph.sum_duplicates()
+    # n_vertices = graph.shape[1]
 
     if n_epochs <= 0:
         # For smaller datasets we can use more epochs
-        if graph.shape[0] <= 10000:
+        if data.shape[0] <= 10000:
             n_epochs = 500
         else:
             n_epochs = 200
@@ -38,24 +38,17 @@ def embed_graph(
     if init == 'random':
         # embedding = 10 * np.random.randn(graph.shape[0], n_components)
         # embedding = embedding - np.min(embedding, 0)
-        embedding = np.random.uniform(0, 10, size=(graph.shape[0], n_components))
+        embedding = np.random.uniform(0, 10, size=(data.shape[0], n_components))
     else:
         raise NotImplementedError('Only random initialization of embedding is implemented')
-
-    # all the graph probabilities are encoded in the sampling opportunity over epochs per sample
-    weights = graph.data
-    epochs_per_sample = -np.ones(weights.shape[0])
-    n_samples = n_epochs * (weights / weights.max())
-    # set how often (eg. long) a given sample is sampled according to the weight of its edges
-    epochs_per_sample[n_samples > 1/(n_epochs+1)] = n_epochs / n_samples[n_samples > 1/(n_epochs+1)]
 
     embedding = optimize_layout(
         embedding,
         None,
-        graph.col, graph.row,
+        knn,
         n_epochs,
-        n_vertices,
-        epochs_per_sample,
+        # n_vertices,
+        # epochs_per_sample,
         a, b,
         gamma,
         initial_alpha,
@@ -67,11 +60,13 @@ def embed_graph(
 def optimize_layout(
         head_embedding,
         tail_embedding,
-        head,
-        tail,
+        # head,
+        # tail,
+        # weight,
+        knn,
         n_epochs,
-        n_vertices,
-        epochs_per_sample,
+        # n_vertices,
+        # epochs_per_sample,
         a, b,
         gamma=1,
         initial_alpha=1,
@@ -82,104 +77,78 @@ def optimize_layout(
         tail_embedding = head_embedding
     alpha = initial_alpha
 
-    epochs_per_negative_sample = epochs_per_sample / negative_sample_rate
-    # monitor backlog of due negative sampling
-    epoch_of_next_negative_sample = epochs_per_negative_sample.copy()
-    epoch_of_next_sample = epochs_per_sample.copy()
+    n_vertices = len(knn)
 
     for n in range(n_epochs):
-        _optimize_one_epoch(
+        _optimize_layout_one_epoch(
             head_embedding,
             tail_embedding,
-            head,
-            tail,
+            knn,
             n_vertices,
-            epochs_per_sample,
             a, b,
             gamma,
             same_embs,
             alpha,
-            epochs_per_negative_sample,
-            epoch_of_next_negative_sample,
-            epoch_of_next_sample,
-            n)
+            negative_sample_rate)
 
         alpha = initial_alpha * (1.0 - (float(n) / float(n_epochs)))
 
     return head_embedding
 
 
-def _optimize_one_epoch(
+def _optimize_layout_one_epoch(
         head_embedding,
         tail_embedding,
-        head,
-        tail,
+        knn,
         n_vertices,
-        epochs_per_sample,
         a, b,
         gamma,
         same_embs,
         alpha,
-        epochs_per_negative_sample,
-        epoch_of_next_negative_sample,
-        epoch_of_next_sample,
-        epoch):
+        negative_sample_rate):
 
-    def clip(val):
-        return np.minimum(4, np.maximum(-4, val))
+    for j, (ks, weight) in enumerate(knn):
+        keep = np.random.random() <= weight
+        if np.any(keep):
+            ks = ks[keep]
+            current, others = head_embedding[j], tail_embedding[ks.astype(int)]
 
-    def dpos_dy(current, other):
-        d_sq = sqeuclidean(current, other)
-        if d_sq > 0.0:
-            grad_coeff = -2.0 * a * b * pow(d_sq, b - 1.0)
-            grad_coeff /= a * pow(d_sq, b) + 1.0
-            return clip(grad_coeff * (current - other))
-        return np.zeros_like(current)
+            dpos = dpos_dy(current, others, a, b)
+            current += alpha * np.sum(dpos, axis=0)
+            if same_embs:
+                others += -alpha * dpos
 
-    def dneg_dy(current, others):
-        d_sq = cdist(current[np.newaxis, :], others,
-                     'sqeuclidean').reshape((-1, 1))
-        grad_coeff = 2.0 * gamma * b / (
-                (0.001 + d_sq) * (a * pow(d_sq, b) + 1))
-        grad_coeff[d_sq <= 0] = 0
+            ks = np.random.randint(0, n_vertices - 1, negative_sample_rate*np.sum(keep))
+            while np.any(ks == j):
+                ks[ks == j] = np.random.randint(0, n_vertices - 1, np.sum(ks == j))
+            others = tail_embedding[ks]
+            dneg = dneg_dy(current, others, gamma, a, b)
+            current += alpha * np.sum(dneg, axis=0)
+            if same_embs:
+                others += -alpha * dneg
 
-        grad_d = clip(grad_coeff * (current[np.newaxis, :] - others))
-        grad_d[grad_coeff[:, 0] <= 0, :] = 4
-        return grad_d
 
-    for i, max_e in enumerate(epoch_of_next_sample):
-        if max_e > epoch:
-            continue
-        j, k = head[i], tail[i]
-        current, other = head_embedding[j], tail_embedding[k]
+def clip(val):
+    return np.minimum(MAX_GRAD, np.maximum(-MAX_GRAD, val))
 
-        dpos = dpos_dy(current, other)
-        current += alpha * dpos
-        if same_embs:
-            other += -alpha * dpos
 
-        epoch_of_next_sample[i] += epochs_per_sample[i]
+def dpos_dy(current, others, a, b):
+    d_sq = np.sum(np.square(current[np.newaxis, :] - others), axis=1, keepdims=True)
+    grad_coeff = np.zeros_like(d_sq)
+    grad_coeff[d_sq > 0] = -2.0 * a * b * (pow(d_sq[d_sq > 0], b - 1.0)
+                                           / (a * pow(d_sq[d_sq > 0], b) + 1.0))
+    return clip(grad_coeff * (current[np.newaxis, :] - others))
 
-        n_neg_samples = int(
-            (epoch - epoch_of_next_negative_sample[i]) / epochs_per_negative_sample[i]
-        )
 
-        if n_neg_samples <= 0:
-            continue
+def dneg_dy(current, others, gamma, a, b):
+    d_sq = np.sum(np.square(current[np.newaxis, :] - others), axis=1, keepdims=True)
+    grad_coeff = 2.0 * gamma * b / (
+            (0.001 + d_sq) * (a * pow(d_sq, b) + 1))
+    grad_coeff[d_sq <= 0] = 0
 
-        k = np.random.randint(0, n_vertices - 1, n_neg_samples)
-        while any(k == j):
-            k[k == j] = np.random.randint(0, n_vertices - 1, np.sum(k == j))
-
-        others = tail_embedding[k]
-        dneg = dneg_dy(current, others)
-        current += alpha * np.sum(dneg, axis=0)
-        if same_embs:
-            others += -alpha * dneg
-
-        epoch_of_next_negative_sample[i] += (
-                n_neg_samples * epochs_per_negative_sample[i]
-        )
+    grad_d = clip(grad_coeff * (current[np.newaxis, :] - others))
+    grad_d[grad_coeff[:, 0] <= 0, :] = MAX_GRAD
+    return grad_d
 
 
 def build_graph(X, n_neighbors):
@@ -201,6 +170,30 @@ def build_graph(X, n_neighbors):
     return s_pij, sigmas, rhos
 
 
+def build_graph_nocoo(X, n_neighbors):
+    knn_d = nearer_neighbours(X, n_neighbors)
+
+    sigmas, rhos = smooth_knn_dist(knn_d, n_neighbors)
+    knn_w = compute_graph_weights(np.array(knn_d), sigmas, rhos)
+
+    # knn_w = np.concatenate([knn_w, ])
+    knn_list = [knn for knn in knn_w]
+    for i in range(len(knn_list)):
+        new, new_w = np.where(knn_w[:, 0, :] == i)
+        dup = np.isin(new, knn_w[i, 0, :])
+        for ii, j in enumerate(knn_w[i, 0, :]):
+            if j not in new[dup]:
+                continue
+            jj = np.where(j == new[dup])[0]
+            w_ij, w_ji = knn_w[i, 1, ii], knn_w[j.astype(int), 1, jj]
+            knn_list[i][1, ii] = w_ij + w_ji - w_ij*w_ji
+
+        knn_list[i] = np.concatenate(
+            [knn_list[i], np.row_stack([new[~dup], knn_w[new[~dup], 1, new_w[~dup]]])], axis=1)
+
+    return knn_list, sigmas, rhos
+
+
 def random_nn_trees(X, num_trees):
     t = AnnoyIndex(X.shape[1], 'euclidean')
     for i in range(X.shape[0]):
@@ -209,43 +202,13 @@ def random_nn_trees(X, num_trees):
     return t
 
 
-# def nearest_neighbours(X, k, num_trees=5, num_iters=1):
-#     r_forest = random_nn_trees(X, num_trees)
-#     knn = [r_forest.get_nns_by_item(i, k, include_distances=True) for i in range(X.shape[0])]
-#     for i in range(X.shape[0]):
-#         knn[i] = (-np.array(knn[i][1][1:]), np.array(knn[i][0][1:]))
-#
-#     for _ in range(num_iters):
-#         old_knn = knn
-#         for i in range(X.shape[0]):
-#             h = list(zip(*old_knn[i]))
-#             heapq.heapify(h)
-#             for j in old_knn[i][1]:
-#                 if i == j:
-#                     continue
-#                 for l in old_knn[j][1]:
-#                     if (i == l) or (l in list(zip(*h))[1]):
-#                         continue
-#                     d_il = euclidean(X[i, :], X[l, :])
-#                     heapq.heappush(h, (-d_il, l))
-#                     if len(h) > k:
-#                         heapq.heappop(h)
-#             knn[i] = list(zip(*h))
-#     knn_dists, knn_indices = zip(*knn)
-#
-#     knn_indices = np.array(knn_indices)
-#     knn_dists = -np.array(knn_dists)
-#
-#     return knn_indices, knn_dists
-
-
 def nearer_neighbours(X, k, num_trees=5, num_iters=2):
     r_forest = random_nn_trees(X, num_trees)
     knn = [r_forest.get_nns_by_item(i, k, include_distances=True) for i in range(X.shape[0])]
     for i in range(X.shape[0]):
         knn[i] = (np.array(knn[i][0][1:]), np.array(knn[i][1][1:]))
     for _ in range(num_iters):
-        old_knn = knn
+        old_knn = copy.deepcopy(knn)
         for i in range(X.shape[0]):
             ind, dist = old_knn[i]
             nn_ind = np.unique([k for j in ind for k in old_knn[j][0]
@@ -254,8 +217,7 @@ def nearer_neighbours(X, k, num_trees=5, num_iters=2):
             dist = np.append(dist, cdist(X[[i], :], X[nn_ind, :]))
             keep = np.argsort(dist)[:k]
             knn[i] = (ind[keep], dist[keep])
-    knn_indices, knn_dists = zip(*knn)
-    return np.array(knn_indices), np.array(knn_dists)
+    return knn
 
 
 def binary_search(f, target, lo=0., mid=1., hi=np.inf, n_iter=64):
@@ -273,44 +235,56 @@ def binary_search(f, target, lo=0., mid=1., hi=np.inf, n_iter=64):
     return mid
 
 
-def smooth_knn_dist(knn_dists, k, bandwidth=1):
+def smooth_knn_dist(knn, k, bandwidth=1):
     target = np.log2(k) * bandwidth
-    rho = np.zeros(knn_dists.shape[0])
-    sigmas = np.zeros(knn_dists.shape[0])
+    rho = np.zeros(len(knn))
+    sigmas = np.zeros(len(knn))
 
-    for i in range(knn_dists.shape[0]):
-        rho[i] = np.min(knn_dists[i, knn_dists[i, :] > 0])
-        d = knn_dists[i, :] - rho[i]
+    means = []
+    for i, (_, dist) in enumerate(knn):
+        rho[i] = np.min(dist[dist > 0])
+        d = dist - rho[i]
         psum = lambda sigma: np.sum(np.exp(-d / sigma))
         sigmas[i] = binary_search(psum, target)
+        means.append(np.mean(dist))
+        if rho[i] == 0:
+            sigmas[i] = np.max(MIN_DIST_SCALE * means[-1], sigmas[i])
 
-    rho0 = rho == 0
-    mean_distances = np.mean(knn_dists, axis=1)
-    sig0 = sigmas < MIN_DIST_SCALE * mean_distances
-    sigmas[~rho0 & sig0] = MIN_DIST_SCALE * mean_distances[~rho0 & sig0]
-    mean_distance = np.mean(mean_distances)
-    sig00 = sigmas < MIN_DIST_SCALE * mean_distance
-    sigmas[rho0 & sig00] = MIN_DIST_SCALE * mean_distance
+    mean_distance = np.mean(means)
+    rho_0 = rho == 0
+    if np.any(rho_0):
+        sigmas[rho_0] = np.max(MIN_DIST_SCALE * mean_distance, sigmas[rho_0])
     return sigmas, rho
 
 
-def compute_graph_weights(knn_indices, knn_dists, sigmas, rhos):
-    n_samples = knn_indices.shape[0]
-    n_neighbors = knn_indices.shape[1]
-
-    rows = np.repeat(np.arange(n_samples), (n_neighbors))
-    cols = knn_indices.reshape((-1))
-
+def compute_graph_weights(knn, sigmas, rhos):
+    # n_samples = knn_indices.shape[0]
+    # n_neighbors = knn_indices.shape[1]
+    #
+    # rows = np.repeat(np.arange(n_samples), n_neighbors)
+    # cols = knn_indices.reshape((-1))
+    #
     rho_m = rhos[:, np.newaxis]
     sig_m = sigmas[:, np.newaxis]
-    ok = (knn_dists - rho_m > 0.0) & (sig_m > 0.0)
 
-    vals = np.exp(- (knn_dists - rho_m) / sig_m)
+    vals = np.exp(- (knn[:, 1, :] - rho_m) / sig_m)
+    ok = (knn[:, 1, :] - rho_m > 0.0) & (sig_m > 0.0)
     vals[~ok] = 1
 
-    vals = vals.reshape((-1))
-
-    return rows, cols, vals
+    knn[:, 1, :] = vals
+    # for i in range(len(knn)):
+    #     ind, dist = knn[i]
+    #     vals = np.exp(- (dist - rhos[i]) / sigmas[i])
+    #     ok = (dist - rhos[i] > 0.0) & (sigmas[i] > 0.0)
+    #     vals[~ok] = 1
+    #     knn[i] = (ind[vals > 0], vals[vals > 0])
+    return knn
+    # vals = np.exp(- (knn_dists - rho_m) / sig_m)
+    # vals[~ok] = 1
+    #
+    # vals = vals.reshape((-1))
+    #
+    # return rows, cols, vals
 
 
 def find_ab_params(spread, min_dist):

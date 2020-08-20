@@ -1,19 +1,16 @@
 from annoy import AnnoyIndex
 import copy
-from numba import jit
 import numpy as np
 from scipy.optimize import curve_fit
-from scipy.sparse import coo_matrix
-from scipy.spatial.distance import cdist
 
 TOLERANCE = 1e-5
-MAX_GRAD = 4.0
+MAX_GRAD = 6.0
 MIN_DIST_SCALE = 1e-3
 
 
 def embed_graph(
-        data,  # needed for spectral embedding
         knn,
+        n_vertices,
         n_components,
         initial_alpha,  # self.learning_rate
         a,
@@ -23,22 +20,18 @@ def embed_graph(
         n_epochs=0,
         init='random'
 ):
-    # graph = graph.tocoo()
-    # graph.sum_duplicates()
-    # n_vertices = graph.shape[1]
-
     if n_epochs <= 0:
         # For smaller datasets we can use more epochs
-        if data.shape[0] <= 10000:
+        if n_vertices <= 10000:
             n_epochs = 500
         else:
             n_epochs = 200
 
     # TODO: implement spectral?
     if init == 'random':
-        # embedding = 10 * np.random.randn(graph.shape[0], n_components)
+        embedding = 10 * np.random.randn(n_vertices, n_components)
         # embedding = embedding - np.min(embedding, 0)
-        embedding = np.random.uniform(0, 10, size=(data.shape[0], n_components))
+        # embedding = np.random.uniform(0, 10, size=(n_vertices, n_components))
     else:
         raise NotImplementedError('Only random initialization of embedding is implemented')
 
@@ -47,8 +40,7 @@ def embed_graph(
         None,
         knn,
         n_epochs,
-        # n_vertices,
-        # epochs_per_sample,
+        n_vertices,
         a, b,
         gamma,
         initial_alpha,
@@ -60,13 +52,9 @@ def embed_graph(
 def optimize_layout(
         head_embedding,
         tail_embedding,
-        # head,
-        # tail,
-        # weight,
         knn,
         n_epochs,
-        # n_vertices,
-        # epochs_per_sample,
+        n_vertices,
         a, b,
         gamma=1,
         initial_alpha=1,
@@ -76,8 +64,6 @@ def optimize_layout(
     if same_embs:
         tail_embedding = head_embedding
     alpha = initial_alpha
-
-    n_vertices = len(knn)
 
     for n in range(n_epochs):
         _optimize_layout_one_epoch(
@@ -133,7 +119,7 @@ def clip(val):
 
 
 def dpos_dy(current, others, a, b):
-    d_sq = np.sum(np.square(current[np.newaxis, :] - others), axis=1, keepdims=True)
+    d_sq = l2_sq(current, others)
     grad_coeff = np.zeros_like(d_sq)
     grad_coeff[d_sq > 0] = -2.0 * a * b * (pow(d_sq[d_sq > 0], b - 1.0)
                                            / (a * pow(d_sq[d_sq > 0], b) + 1.0))
@@ -141,7 +127,7 @@ def dpos_dy(current, others, a, b):
 
 
 def dneg_dy(current, others, gamma, a, b):
-    d_sq = np.sum(np.square(current[np.newaxis, :] - others), axis=1, keepdims=True)
+    d_sq = l2_sq(current, others)
     grad_coeff = 2.0 * gamma * b / (
             (0.001 + d_sq) * (a * pow(d_sq, b) + 1))
     grad_coeff[d_sq <= 0] = 0
@@ -151,47 +137,46 @@ def dneg_dy(current, others, gamma, a, b):
     return grad_d
 
 
-def build_graph(X, n_neighbors):
-    knn_indices, knn_dists = nearer_neighbours(X, n_neighbors)
-
-    sigmas, rhos = smooth_knn_dist(knn_dists, n_neighbors)
-    rows, cols, vals = compute_graph_weights(knn_indices, knn_dists, sigmas, rhos)
-
-    s_pigj = coo_matrix(
-        (vals, (rows, cols)), shape=(X.shape[0], X.shape[0])
-    )
-    s_pigj.eliminate_zeros()
-
-    s_pjgi = s_pigj.transpose()
-    prod_matrix = s_pigj.multiply(s_pjgi)
-    s_pij = s_pigj + s_pjgi - prod_matrix
-    s_pij.eliminate_zeros()
-
-    return s_pij, sigmas, rhos
-
-
 def build_graph_nocoo(X, n_neighbors):
     knn_d = nearer_neighbours(X, n_neighbors)
 
     sigmas, rhos = smooth_knn_dist(knn_d, n_neighbors)
     knn_w = compute_graph_weights(np.array(knn_d), sigmas, rhos)
 
-    # knn_w = np.concatenate([knn_w, ])
-    knn_list = [knn for knn in knn_w]
-    for i in range(len(knn_list)):
+    knn_list = []
+    for i in range(knn_w.shape[0]):
         new, new_w = np.where(knn_w[:, 0, :] == i)
         dup = np.isin(new, knn_w[i, 0, :])
         for ii, j in enumerate(knn_w[i, 0, :]):
             if j not in new[dup]:
                 continue
-            jj = np.where(j == new[dup])[0]
-            w_ij, w_ji = knn_w[i, 1, ii], knn_w[j.astype(int), 1, jj]
-            knn_list[i][1, ii] = w_ij + w_ji - w_ij*w_ji
+            jj = np.where(j == new[dup])[0][0]
+            knn_w[i, 1, ii] = knn_w[i, 1, ii] + knn_w[j.astype(int), 1, jj] - knn_w[i, 1, ii]*knn_w[j.astype(int), 1, jj]
+            knn_w[j.astype(int), 1, jj] = 0
 
-        knn_list[i] = np.concatenate(
-            [knn_list[i], np.row_stack([new[~dup], knn_w[new[~dup], 1, new_w[~dup]]])], axis=1)
+        knn_list.append(np.concatenate(
+            [knn_w[i, :, :], np.row_stack([new[~dup], knn_w[new[~dup], 1, new_w[~dup]]])], axis=1))
 
     return knn_list, sigmas, rhos
+
+
+# def build_graph(X, n_neighbors):
+#     knn_indices, knn_dists = nearer_neighbours(X, n_neighbors)
+#
+#     sigmas, rhos = smooth_knn_dist(knn_dists, n_neighbors)
+#     rows, cols, vals = compute_graph_weights(knn_indices, knn_dists, sigmas, rhos)
+#
+#     s_pigj = coo_matrix(
+#         (vals, (rows, cols)), shape=(X.shape[0], X.shape[0])
+#     )
+#     s_pigj.eliminate_zeros()
+#
+#     s_pjgi = s_pigj.transpose()
+#     prod_matrix = s_pigj.multiply(s_pjgi)
+#     s_pij = s_pigj + s_pjgi - prod_matrix
+#     s_pij.eliminate_zeros()
+#
+#     return s_pij, sigmas, rhos
 
 
 def random_nn_trees(X, num_trees):
@@ -214,10 +199,17 @@ def nearer_neighbours(X, k, num_trees=5, num_iters=2):
             nn_ind = np.unique([k for j in ind for k in old_knn[j][0]
                                 if (k != i) and (k not in ind)])
             ind = np.append(ind, nn_ind)
-            dist = np.append(dist, cdist(X[[i], :], X[nn_ind, :]))
+            dist = np.append(dist, l2_sq(X[i, :], X[nn_ind, :]))
             keep = np.argsort(dist)[:k]
             knn[i] = (ind[keep], dist[keep])
     return knn
+
+
+def l2_sq(x, y):
+    if len(x.shape) < len(y.shape):
+        return np.sum(np.square(x[np.newaxis, :] - y),
+                      axis=1, keepdims=True)
+    return np.sum(np.square(x - y), axis=1, keepdims=True)
 
 
 def binary_search(f, target, lo=0., mid=1., hi=np.inf, n_iter=64):
@@ -258,12 +250,6 @@ def smooth_knn_dist(knn, k, bandwidth=1):
 
 
 def compute_graph_weights(knn, sigmas, rhos):
-    # n_samples = knn_indices.shape[0]
-    # n_neighbors = knn_indices.shape[1]
-    #
-    # rows = np.repeat(np.arange(n_samples), n_neighbors)
-    # cols = knn_indices.reshape((-1))
-    #
     rho_m = rhos[:, np.newaxis]
     sig_m = sigmas[:, np.newaxis]
 
@@ -272,19 +258,7 @@ def compute_graph_weights(knn, sigmas, rhos):
     vals[~ok] = 1
 
     knn[:, 1, :] = vals
-    # for i in range(len(knn)):
-    #     ind, dist = knn[i]
-    #     vals = np.exp(- (dist - rhos[i]) / sigmas[i])
-    #     ok = (dist - rhos[i] > 0.0) & (sigmas[i] > 0.0)
-    #     vals[~ok] = 1
-    #     knn[i] = (ind[vals > 0], vals[vals > 0])
     return knn
-    # vals = np.exp(- (knn_dists - rho_m) / sig_m)
-    # vals[~ok] = 1
-    #
-    # vals = vals.reshape((-1))
-    #
-    # return rows, cols, vals
 
 
 def find_ab_params(spread, min_dist):

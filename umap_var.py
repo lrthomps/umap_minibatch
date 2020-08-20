@@ -24,7 +24,7 @@ class UMAP:
         self.init = init
 
         self._a, self._b = None, None
-        self.r_forest = None
+        # self.r_forest = None
         self.sigmas = None
         self.rhos = None
         self.graph = None
@@ -34,8 +34,8 @@ class UMAP:
         self._a, self._b = u.find_ab_params(self.spread, self.min_dist)
         self.graph, self.sigmas, self.rhos = u.build_graph_nocoo(X, self.n_neighbors)
         self.embedding = u.embed_graph(
-            X,  # needed for spectral embedding
             self.graph,
+            X.shape[0],
             self.n_components,
             self._initial_alpha,  # self.learning_rate
             self._a,

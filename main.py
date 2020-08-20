@@ -10,7 +10,7 @@ if __name__ == '__main__':
     X, y = load_boston(return_X_y=True)
     X = (X - np.mean(X, axis=0, keepdims=True)) / np.std(X, axis=0, keepdims=True)
     reducer = umapp.UMAP(init='random',
-                         n_neighbors=15, min_dist=2)
+                         n_neighbors=15)
 
     t0 = time.time()
     embedding = reducer.fit_transform(X)

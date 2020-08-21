@@ -30,6 +30,7 @@ def embed_graph(
             n_epochs = 200
 
     # TODO: implement spectral?
+    np.random.seed(1979)
     if init == 'random':
         # embedding = 10 * np.random.randn(n_vertices, n_components)
         # embedding = embedding - np.min(embedding, 0)
@@ -37,16 +38,11 @@ def embed_graph(
     else:
         raise NotImplementedError('Only random initialization of embedding is implemented')
 
-    # print(optimize_nothing(
-    #     embedding,
-    #     knn,
-    #     n_epochs,
-    #     negative_sample_rate))
-
     embedding = optimize_layout(
         embedding,
         knn,
         n_epochs,
+        1,
         n_vertices,
         a, b,
         gamma,
@@ -56,61 +52,61 @@ def embed_graph(
     return embedding
 
 
-def optimize_nothing(
-        embedding,
-        knn,
-        n_epochs,
-        negative_sample_rate
-):
-    summed = np.zeros(2)
-    for n in range(n_epochs):
-        for j, (ks, weight) in enumerate(knn):
-            summed += embedding[j, :]/10 + np.sum(embedding[ks.astype(int), :], axis=0)/100
-            ks = np.arange(0, negative_sample_rate * len(ks), 3)
-            summed += np.sum(embedding[ks, :], axis=0)/100
-    return summed
-
-
 def optimize_layout(
         embedding,
         knn,
         n_epochs,
+        minibatch,
         n_vertices,
         a, b,
         gamma=1,
         initial_alpha=1,
         negative_sample_rate=5,
 ):
-    def get_next(k, i_last):
-        next = np.arange(i_last, i_last + k)
-        i_last += k
-        if i_last >= n_vertices:
-            next[next >= n_vertices] -= n_vertices
-            i_last -= n_vertices
-        return next, i_last
+    def next_batch(knn):
+        i_last = 0
+        while True:
+            yield knn[:, i_last:i_last+minibatch]
+            i_last += minibatch
+            if i_last >= n_vertices:
+                break
 
-    i_last = 1
+    def get_next(k, ir):
+        next = np.arange(ir, ir + k)
+        ir += k
+        if ir >= n_vertices:
+            next[next >= n_vertices] -= n_vertices
+            ir -= n_vertices
+        return next, ir
+
+    ir = minibatch * 2
 
     alpha = 2.0 * b * initial_alpha
     da = alpha / n_epochs
 
     for n in range(n_epochs):
-        for j, (kpos, weight) in enumerate(knn):
-            keep = random.random() <= weight
+        for js, kpos, weight in next_batch(knn):
+            keep = 0.6 <= weight
             kpos = kpos[keep].astype(int)
             if len(kpos) == 0:
                 continue
+            js = js[keep].astype(int)
 
-            dpos = dpos_dy(embedding[[j], :], embedding[kpos, :], a, b)
+            dpos = dpos_dy(embedding[js, :], embedding[kpos, :], a, b)
+            print(f'(j, k)=({js}, {kpos}) dpos: {dpos}')
             embedding[kpos, :] += -alpha * dpos
 
-            kneg, i_last = get_next(negative_sample_rate * len(kpos), i_last)
-            while np.any(kneg == j):
-                kneg[kneg == j], i_last = get_next(np.sum(kneg == j), i_last)
+            for _ in range(negative_sample_rate):
+                kneg, ir = get_next(len(kpos), ir)
+                while np.any(kneg == js):
+                    kneg[kneg == js], ir = get_next(np.sum(kneg == js), ir)
 
-            dneg = dneg_dy(embedding[[j], :], embedding[kneg], gamma, a, b)
-            embedding[j, :] += alpha * (np.sum(dneg, axis=0) + np.sum(dpos, axis=0))
-            embedding[kneg] += -alpha * dneg
+                dneg = dneg_dy(embedding[js, :], embedding[kneg], gamma, a, b)
+                print(f'(j, k)=({js}, {kneg}) dneg: {dneg}')
+                embedding[js, :] += alpha * (dpos + dneg)
+                embedding[kneg] += -alpha * dneg
+            break
+        break
         alpha -= da
 
     return embedding
@@ -157,27 +153,10 @@ def build_graph_nocoo(X, n_neighbors):
 
         knn_list.append(np.concatenate(
             [knn_w[i, :, :], np.row_stack([new[~dup], knn_w[new[~dup], 1, new_w[~dup]]])], axis=1))
+        knn_list[-1] = np.concatenate([i*np.ones((1, knn_list[-1].shape[1])), knn_list[-1]], axis=0)
 
-    return knn_list, sigmas, rhos
-
-
-# def build_graph(X, n_neighbors):
-#     knn_indices, knn_dists = nearer_neighbours(X, n_neighbors)
-#
-#     sigmas, rhos = smooth_knn_dist(knn_dists, n_neighbors)
-#     rows, cols, vals = compute_graph_weights(knn_indices, knn_dists, sigmas, rhos)
-#
-#     s_pigj = coo_matrix(
-#         (vals, (rows, cols)), shape=(X.shape[0], X.shape[0])
-#     )
-#     s_pigj.eliminate_zeros()
-#
-#     s_pjgi = s_pigj.transpose()
-#     prod_matrix = s_pigj.multiply(s_pjgi)
-#     s_pij = s_pigj + s_pjgi - prod_matrix
-#     s_pij.eliminate_zeros()
-#
-#     return s_pij, sigmas, rhos
+    knn_m = np.concatenate(knn_list, axis=1)
+    return knn_m, sigmas, rhos
 
 
 def random_nn_trees(X, num_trees):

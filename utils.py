@@ -1,10 +1,12 @@
 from annoy import AnnoyIndex
 import copy
 import numpy as np
+import random
 from scipy.optimize import curve_fit
 
+
 TOLERANCE = 1e-5
-MAX_GRAD = 6.0
+MAX_GRAD = 3.0
 MIN_DIST_SCALE = 1e-3
 
 
@@ -29,15 +31,20 @@ def embed_graph(
 
     # TODO: implement spectral?
     if init == 'random':
-        embedding = 10 * np.random.randn(n_vertices, n_components)
+        # embedding = 10 * np.random.randn(n_vertices, n_components)
         # embedding = embedding - np.min(embedding, 0)
-        # embedding = np.random.uniform(0, 10, size=(n_vertices, n_components))
+        embedding = np.random.uniform(0, 10, size=(n_vertices, n_components))
     else:
         raise NotImplementedError('Only random initialization of embedding is implemented')
 
+    # print(optimize_nothing(
+    #     embedding,
+    #     knn,
+    #     n_epochs,
+    #     negative_sample_rate))
+
     embedding = optimize_layout(
         embedding,
-        None,
         knn,
         n_epochs,
         n_vertices,
@@ -49,9 +56,23 @@ def embed_graph(
     return embedding
 
 
+def optimize_nothing(
+        embedding,
+        knn,
+        n_epochs,
+        negative_sample_rate
+):
+    summed = np.zeros(2)
+    for n in range(n_epochs):
+        for j, (ks, weight) in enumerate(knn):
+            summed += embedding[j, :]/10 + np.sum(embedding[ks.astype(int), :], axis=0)/100
+            ks = np.arange(0, negative_sample_rate * len(ks), 3)
+            summed += np.sum(embedding[ks, :], axis=0)/100
+    return summed
+
+
 def optimize_layout(
-        head_embedding,
-        tail_embedding,
+        embedding,
         knn,
         n_epochs,
         n_vertices,
@@ -60,58 +81,39 @@ def optimize_layout(
         initial_alpha=1,
         negative_sample_rate=5,
 ):
-    same_embs = tail_embedding is None
-    if same_embs:
-        tail_embedding = head_embedding
-    alpha = initial_alpha
+    def get_next(k, i_last):
+        next = np.arange(i_last, i_last + k)
+        i_last += k
+        if i_last >= n_vertices:
+            next[next >= n_vertices] -= n_vertices
+            i_last -= n_vertices
+        return next, i_last
+
+    i_last = 1
+
+    alpha = 2.0 * b * initial_alpha
+    da = alpha / n_epochs
 
     for n in range(n_epochs):
-        _optimize_layout_one_epoch(
-            head_embedding,
-            tail_embedding,
-            knn,
-            n_vertices,
-            a, b,
-            gamma,
-            same_embs,
-            alpha,
-            negative_sample_rate)
+        for j, (kpos, weight) in enumerate(knn):
+            keep = random.random() <= weight
+            kpos = kpos[keep].astype(int)
+            if len(kpos) == 0:
+                continue
 
-        alpha = initial_alpha * (1.0 - (float(n) / float(n_epochs)))
+            dpos = dpos_dy(embedding[[j], :], embedding[kpos, :], a, b)
+            embedding[kpos, :] += -alpha * dpos
 
-    return head_embedding
+            kneg, i_last = get_next(negative_sample_rate * len(kpos), i_last)
+            while np.any(kneg == j):
+                kneg[kneg == j], i_last = get_next(np.sum(kneg == j), i_last)
 
+            dneg = dneg_dy(embedding[[j], :], embedding[kneg], gamma, a, b)
+            embedding[j, :] += alpha * (np.sum(dneg, axis=0) + np.sum(dpos, axis=0))
+            embedding[kneg] += -alpha * dneg
+        alpha -= da
 
-def _optimize_layout_one_epoch(
-        head_embedding,
-        tail_embedding,
-        knn,
-        n_vertices,
-        a, b,
-        gamma,
-        same_embs,
-        alpha,
-        negative_sample_rate):
-
-    for j, (ks, weight) in enumerate(knn):
-        keep = np.random.random() <= weight
-        if np.any(keep):
-            ks = ks[keep]
-            current, others = head_embedding[j], tail_embedding[ks.astype(int)]
-
-            dpos = dpos_dy(current, others, a, b)
-            current += alpha * np.sum(dpos, axis=0)
-            if same_embs:
-                others += -alpha * dpos
-
-            ks = np.random.randint(0, n_vertices - 1, negative_sample_rate*np.sum(keep))
-            while np.any(ks == j):
-                ks[ks == j] = np.random.randint(0, n_vertices - 1, np.sum(ks == j))
-            others = tail_embedding[ks]
-            dneg = dneg_dy(current, others, gamma, a, b)
-            current += alpha * np.sum(dneg, axis=0)
-            if same_embs:
-                others += -alpha * dneg
+    return embedding
 
 
 def clip(val):
@@ -120,19 +122,18 @@ def clip(val):
 
 def dpos_dy(current, others, a, b):
     d_sq = l2_sq(current, others)
-    grad_coeff = np.zeros_like(d_sq)
-    grad_coeff[d_sq > 0] = -2.0 * a * b * (pow(d_sq[d_sq > 0], b - 1.0)
-                                           / (a * pow(d_sq[d_sq > 0], b) + 1.0))
-    return clip(grad_coeff * (current[np.newaxis, :] - others))
+    grad_coeff = -a * (np.power(d_sq, b - 1.0)
+                       / (a * np.power(d_sq, b) + 1.0))
+    return clip(grad_coeff * (current - others))
 
 
 def dneg_dy(current, others, gamma, a, b):
     d_sq = l2_sq(current, others)
-    grad_coeff = 2.0 * gamma * b / (
-            (0.001 + d_sq) * (a * pow(d_sq, b) + 1))
+    grad_coeff = gamma / (
+            (0.001 + d_sq) * (a * np.power(d_sq, b) + 1))
     grad_coeff[d_sq <= 0] = 0
 
-    grad_d = clip(grad_coeff * (current[np.newaxis, :] - others))
+    grad_d = clip(grad_coeff * (current - others))
     grad_d[grad_coeff[:, 0] <= 0, :] = MAX_GRAD
     return grad_d
 
@@ -199,16 +200,13 @@ def nearer_neighbours(X, k, num_trees=5, num_iters=2):
             nn_ind = np.unique([k for j in ind for k in old_knn[j][0]
                                 if (k != i) and (k not in ind)])
             ind = np.append(ind, nn_ind)
-            dist = np.append(dist, l2_sq(X[i, :], X[nn_ind, :]))
+            dist = np.append(dist, l2_sq(X[[i], :], X[nn_ind, :]))
             keep = np.argsort(dist)[:k]
             knn[i] = (ind[keep], dist[keep])
     return knn
 
 
 def l2_sq(x, y):
-    if len(x.shape) < len(y.shape):
-        return np.sum(np.square(x[np.newaxis, :] - y),
-                      axis=1, keepdims=True)
     return np.sum(np.square(x - y), axis=1, keepdims=True)
 
 

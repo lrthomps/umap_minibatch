@@ -2,5 +2,6 @@ annoy
 matplotlib
 numpy
 scipy
+seaborn
 sklearn
 umap-learn

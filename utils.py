@@ -5,8 +5,9 @@ import random
 from scipy.optimize import curve_fit
 
 
+BOXMIN = np.array([10, 2])
 TOLERANCE = 1e-5
-MAX_GRAD = 3.0
+MAX_GRAD = 4.0
 MIN_DIST_SCALE = 1e-3
 
 
@@ -30,11 +31,8 @@ def embed_graph(
             n_epochs = 200
 
     # TODO: implement spectral?
-    np.random.seed(1979)
     if init == 'random':
-        # embedding = 10 * np.random.randn(n_vertices, n_components)
-        # embedding = embedding - np.min(embedding, 0)
-        embedding = np.random.uniform(0, 10, size=(n_vertices, n_components))
+        embedding = np.random.uniform(0, 4, size=(n_vertices, n_components))
     else:
         raise NotImplementedError('Only random initialization of embedding is implemented')
 
@@ -42,7 +40,7 @@ def embed_graph(
         embedding,
         knn,
         n_epochs,
-        1,
+        knn.shape[1] // 4,
         n_vertices,
         a, b,
         gamma,
@@ -63,50 +61,49 @@ def optimize_layout(
         initial_alpha=1,
         negative_sample_rate=5,
 ):
-    def next_batch(knn):
-        i_last = 0
-        while True:
-            yield knn[:, i_last:i_last+minibatch]
-            i_last += minibatch
-            if i_last >= n_vertices:
-                break
-
-    def get_next(k, ir):
-        next = np.arange(ir, ir + k)
-        ir += k
-        if ir >= n_vertices:
-            next[next >= n_vertices] -= n_vertices
-            ir -= n_vertices
-        return next, ir
+    def batch(knn, k=minibatch):
+        ir = np.random.choice(knn.shape[1], k)
+        return knn[:, ir]
 
     ir = minibatch * 2
 
-    alpha = 2.0 * b * initial_alpha
-    da = alpha / n_epochs
+    def neg_samples(k):
+        nonlocal ir
+        next = np.arange(ir, ir + k)
+        ir += k
+        while ir >= n_vertices:
+            next[next >= n_vertices] -= n_vertices
+            ir -= n_vertices
+        return next
 
-    for n in range(n_epochs):
-        for js, kpos, weight in next_batch(knn):
-            keep = 0.6 <= weight
-            kpos = kpos[keep].astype(int)
-            if len(kpos) == 0:
-                continue
-            js = js[keep].astype(int)
+    alpha = initial_alpha
+    n_eff = n_epochs * knn.shape[1] // minibatch
+    da = alpha / n_eff
 
-            dpos = dpos_dy(embedding[js, :], embedding[kpos, :], a, b)
-            print(f'(j, k)=({js}, {kpos}) dpos: {dpos}')
-            embedding[kpos, :] += -alpha * dpos
+    for _ in range(n_eff):
+        js, kpos, weight = batch(knn)
+        keep = random.random() <= weight
+        kpos = kpos[keep].astype(int)
+        if len(kpos) == 0:
+            continue
+        js = js[keep].astype(int)
 
-            for _ in range(negative_sample_rate):
-                kneg, ir = get_next(len(kpos), ir)
-                while np.any(kneg == js):
-                    kneg[kneg == js], ir = get_next(np.sum(kneg == js), ir)
+        dpos = dpos_dy(embedding[js], embedding[kpos], a, b)
+        embedding[kpos, :] += -alpha * dpos
 
-                dneg = dneg_dy(embedding[js, :], embedding[kneg], gamma, a, b)
-                print(f'(j, k)=({js}, {kneg}) dneg: {dneg}')
-                embedding[js, :] += alpha * (dpos + dneg)
-                embedding[kneg] += -alpha * dneg
-            break
-        break
+        for _ in range(negative_sample_rate):
+            kneg = neg_samples(len(kpos))
+            while True:
+                drop = (kneg == js) | (kneg == kpos)
+                if ~np.any(drop):
+                    break
+                kneg[drop] = neg_samples(np.sum(drop))
+
+            dneg = dneg_dy(embedding[js], embedding[kneg], gamma, a, b)
+            dpos += dneg
+            embedding[kneg] += -alpha * dneg
+        embedding[js, :] += alpha * (dpos + dneg)
+
         alpha -= da
 
     return embedding
@@ -116,29 +113,55 @@ def clip(val):
     return np.minimum(MAX_GRAD, np.maximum(-MAX_GRAD, val))
 
 
-def dpos_dy(current, others, a, b):
-    d_sq = l2_sq(current, others)
-    grad_coeff = -a * (np.power(d_sq, b - 1.0)
-                       / (a * np.power(d_sq, b) + 1.0))
-    return clip(grad_coeff * (current - others))
+def dpos_dy(current, others, a, b, boxmin=BOXMIN):
+    del_x = current - others
+    d_sq = dist(del_x)
+    if boxmin is not None:
+        d = np.sqrt(d_sq)
+
+        hat_x = del_x / d
+        case = np.argmin(boxmin * hat_x, axis=1)
+        dbox = boxmin[case] - np.abs(del_x[np.arange(len(case)), case])
+        ob = dbox > 0
+
+    grad_coeff = -2.0 * a * b * (np.power(d_sq, b - 1.0)
+                                 / (a * np.power(d_sq, b) + 1.0))
+    grad = clip(grad_coeff * del_x)
+    if boxmin is not None:
+        grad[ob, case[ob]] = -np.sign(grad[ob, case[ob]]) * dbox[ob]
+    return grad
 
 
-def dneg_dy(current, others, gamma, a, b):
-    d_sq = l2_sq(current, others)
-    grad_coeff = gamma / (
+def dneg_dy(current, others, gamma, a, b, boxmin=BOXMIN):
+    del_x = current - others
+    d_sq = dist(del_x)
+    if boxmin is not None:
+        d = np.sqrt(d_sq)
+
+        hat_x = del_x / d
+        case = np.argmin(boxmin * hat_x, axis=1)
+        dbox = boxmin[case] - np.abs(del_x[np.arange(len(case)), case])
+        ob = dbox > 0
+
+    grad_coeff = 2.0 * b * gamma / (
             (0.001 + d_sq) * (a * np.power(d_sq, b) + 1))
     grad_coeff[d_sq <= 0] = 0
-
-    grad_d = clip(grad_coeff * (current - others))
+    grad_d = clip(grad_coeff * del_x)
     grad_d[grad_coeff[:, 0] <= 0, :] = MAX_GRAD
+    if boxmin is not None:
+        grad_d[ob, case[ob]] = np.sign(grad_d[ob, case[ob]]) * dbox[ob]
     return grad_d
 
 
-def build_graph_nocoo(X, n_neighbors):
-    knn_d = nearer_neighbours(X, n_neighbors)
+def build_graph_nocoo(X, n_neighbors, counts=None):
+    num_iters = max(0, 3 - int(np.log10(X.shape[0])))
+    knn_d = nearer_neighbours(X, n_neighbors, num_iters=num_iters)
 
     sigmas, rhos = smooth_knn_dist(knn_d, n_neighbors)
     knn_w = compute_graph_weights(np.array(knn_d), sigmas, rhos)
+
+    if counts is not None:
+        knn_w[:, 1, :] *= counts[:, np.newaxis] / np.max(counts)
 
     knn_list = []
     for i in range(knn_w.shape[0]):
@@ -167,7 +190,7 @@ def random_nn_trees(X, num_trees):
     return t
 
 
-def nearer_neighbours(X, k, num_trees=5, num_iters=2):
+def nearer_neighbours(X, k, num_trees=5, num_iters=0):
     r_forest = random_nn_trees(X, num_trees)
     knn = [r_forest.get_nns_by_item(i, k, include_distances=True) for i in range(X.shape[0])]
     for i in range(X.shape[0]):
@@ -175,18 +198,22 @@ def nearer_neighbours(X, k, num_trees=5, num_iters=2):
     for _ in range(num_iters):
         old_knn = copy.deepcopy(knn)
         for i in range(X.shape[0]):
-            ind, dist = old_knn[i]
+            ind, d = old_knn[i]
             nn_ind = np.unique([k for j in ind for k in old_knn[j][0]
                                 if (k != i) and (k not in ind)])
             ind = np.append(ind, nn_ind)
-            dist = np.append(dist, l2_sq(X[[i], :], X[nn_ind, :]))
-            keep = np.argsort(dist)[:k]
-            knn[i] = (ind[keep], dist[keep])
+            d = np.append(d, dist(X[[i], :] - X[nn_ind, :]))
+            keep = np.argsort(d)[:k]
+            knn[i] = (ind[keep], d[keep])
     return knn
 
 
-def l2_sq(x, y):
-    return np.sum(np.square(x - y), axis=1, keepdims=True)
+def dist(x_y, metric='sqeuclidean'):
+    d_sq = np.sum(np.square(x_y), axis=1, keepdims=True)
+    if metric == 'euclidean':
+        return np.sqrt(d_sq)
+    return d_sq
+    # return cdist(x, y, metric=metric)
 
 
 def binary_search(f, target, lo=0., mid=1., hi=np.inf, n_iter=64):

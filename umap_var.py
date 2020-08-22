@@ -1,4 +1,7 @@
+import numpy as np
+
 import utils as u
+import time
 
 
 class UMAP:
@@ -30,9 +33,15 @@ class UMAP:
         self.graph = None
         self.embedding = None
 
-    def fit(self, X):
+    def fit(self, X, counts=None):
+        t0 = time.time()
         self._a, self._b = u.find_ab_params(self.spread, self.min_dist)
-        self.graph, self.sigmas, self.rhos = u.build_graph_nocoo(X, self.n_neighbors)
+        print(time.time() - t0)
+        t0 = time.time()
+        self.graph, self.sigmas, self.rhos = u.build_graph_nocoo(X, self.n_neighbors, counts)
+
+        print(time.time() - t0)
+        t0 = time.time()
         self.embedding = u.embed_graph(
             self.graph,
             X.shape[0],
@@ -45,9 +54,10 @@ class UMAP:
             n_epochs=0,
             init=self.init
         )
+        print(time.time() - t0)
 
-    def fit_transform(self, X):
-        self.fit(X)
+    def fit_transform(self, X, counts=None):
+        self.fit(X, counts)
         return self.embedding
 
     def transform(self):
